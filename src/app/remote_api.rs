@@ -970,7 +970,8 @@ impl ZaivernApp {
         };
         // 本文つきの確定送信は配達機構へ合流させる。本文と CR を 1 回で書くと
         // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
-        // キー入力 (raw) と空の Enter は 1 打鍵なので従来どおり生書きする。
+        // キー入力 (raw) と、空白しか無い本文 + Enter は従来どおり生書きする
+        // (空白を捨てずに送る。配達機構は空白だけの本文を積まない)。
         if !raw && !payload.trim().is_empty() {
             if self.queue_submit(submit::Job::user(sid, payload)) {
                 return json!({"ok": true}).to_string();
@@ -984,6 +985,7 @@ impl ZaivernApp {
                 if raw {
                     s.write_bytes(payload.as_bytes());
                 } else {
+                    s.write_bytes(payload.as_bytes());
                     s.write_bytes(submit::COMMIT);
                 }
                 json!({"ok": true}).to_string()
