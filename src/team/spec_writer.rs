@@ -466,6 +466,36 @@ fn draft_candidate(stdout: &str, sent: &str) -> Result<String, String> {
     Err(why_no_draft(stdout))
 }
 
+/// 依頼文を**どの口から**渡すかを決める (純関数)。戻り値は (引数, 標準入力)。
+///
+/// **Windows のバッチ (`.cmd` / `.bat`) には引数で渡せない。** std はバッチを
+/// `cmd.exe` 越しに起こし、cmd.exe では安全に逃がせない**改行を含む引数を
+/// `InvalidInput` で拒否する** (起こす前に失敗するので stderr も空)。
+/// npm / pnpm で入れた `claude` / `codex` はまさに `.cmd` のシムなので、
+/// 複数行の依頼文を引数にすると毎回 `SpawnFailed` (127) になっていた。
+/// 改行を潰しても cmd.exe の 8191 文字の上限に当たるので、**標準入力で渡す**
+/// (`claude -p` / `codex exec` は位置引数が無いとき stdin を依頼文として読む)。
+///
+/// 実体が exe 等のときは従来どおり引数で渡す — 動いている経路を変えない。
+/// 拡張子で判定してよいのは、`resolve_in` が PATHEXT を当てて実体の綴りを
+/// 確定させてから呼ばれるため。
+pub(crate) fn prompt_transport<'a>(
+    program: &std::path::Path,
+    args: &'a [String],
+    prompt: &'a str,
+) -> (Vec<&'a str>, Option<&'a str>) {
+    let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let batch = program
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if batch {
+        return (argv, Some(prompt));
+    }
+    argv.push(prompt);
+    (argv, None)
+}
+
 /// 既存の制限付きプロセスランナーで一度だけ生成し、原依頼を無損失で添付する。
 pub fn draft_with(
     program: &std::path::Path,
@@ -476,8 +506,7 @@ pub fn draft_with(
     cancel: &super::launch::CancelFlag,
     pid: &super::launch::PidSlot,
 ) -> Result<String, String> {
-    let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    argv.push(prompt);
+    let (argv, stdin) = prompt_transport(program, args, prompt);
     let (code, outcome, output) = super::launch::run_resolved_capped(
         program,
         &argv,
@@ -486,6 +515,7 @@ pub fn draft_with(
         cancel,
         pid,
         DRAFT_MAX_BYTES + 1,
+        stdin.map(str::as_bytes),
     );
     if outcome != super::model::ValidationOutcome::Passed {
         return Err(crate::i18n::trf(
@@ -524,6 +554,32 @@ fn finish_draft(candidate: &str, original: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::features::team::imp::model::TeamRole as R;
+
+    #[test]
+    fn バッチのシムには依頼文を標準入力で渡す() {
+        // npm / pnpm の `claude.cmd` / `codex.cmd` は改行入りの引数で起こせない。
+        let args = vec!["-p".to_string()];
+        let prompt = "一行目\n二行目";
+        for (program, via_stdin) in [
+            ("claude.cmd", true),
+            ("CODEX.CMD", true),
+            ("tool.bat", true),
+            ("tool.Bat", true),
+            ("claude.exe", false),
+            ("claude", false),
+            ("claude.ps1", false),
+            ("dir.cmd/claude", false),
+        ] {
+            let (argv, stdin) = prompt_transport(std::path::Path::new(program), &args, prompt);
+            if via_stdin {
+                assert_eq!(argv, vec!["-p"], "{program}");
+                assert_eq!(stdin, Some(prompt), "{program}");
+            } else {
+                assert_eq!(argv, vec!["-p", prompt], "{program}");
+                assert_eq!(stdin, None, "{program}");
+            }
+        }
+    }
 
     #[test]
     fn 並列仕様は原依頼を全文保持して担当を要求する() {

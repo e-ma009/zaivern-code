@@ -624,6 +624,7 @@ pub fn run_resolved(
         cancel,
         pid_slot,
         SUCCESS_TAIL_BYTES,
+        None,
     )
 }
 
@@ -636,6 +637,11 @@ pub fn run_resolved(
 ///
 /// **第 2 のランナーを作らない**ためにここで分岐する。時間切れ・停止・
 /// 木ごとの後始末は 1 か所にしか無い状態を保つ。
+///
+/// `stdin` を渡すと子の標準入力へ書いてから閉じる (無ければ null)。
+/// 引数で渡せない依頼文 (Windows のバッチは改行入りの引数を起こせない —
+/// [`super::spec_writer::prompt_transport`]) のための口。
+#[allow(clippy::too_many_arguments)]
 pub fn run_resolved_capped(
     program: &Path,
     args: &[&str],
@@ -644,6 +650,7 @@ pub fn run_resolved_capped(
     cancel: &CancelFlag,
     pid_slot: &PidSlot,
     success_cap: usize,
+    stdin: Option<&[u8]>,
 ) -> (i32, ValidationOutcome, ValidationOutput) {
     use std::sync::atomic::Ordering;
 
@@ -651,7 +658,11 @@ pub fn run_resolved_capped(
     command
         .args(args)
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         // **捨てない。** 捨てると「`cargo test` が落ちた」しか残らず、
         // 直す担当は落ちたテストもコンパイルエラーも見られない。
         .stdout(std::process::Stdio::piped())
@@ -673,6 +684,19 @@ pub fn run_resolved_capped(
     let Ok(mut child) = command.spawn() else {
         return (127, ValidationOutcome::SpawnFailed, ValidationOutput::default());
     };
+    // **書き込みは別スレッドで。** 子が読まずに書き続けると、こちらが
+    // 書き込みで止まり、子は stdout が埋まって止まる (相互に待つ)。
+    // 書き終えたら落として EOF を送る。子が先に終われば書き込みが
+    // 失敗して抜けるだけなので、待たない。
+    if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let data = data.to_vec();
+        let _ = std::thread::Builder::new()
+            .name("zai-team-validate-stdin".into())
+            .spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(&data);
+            });
+    }
     let pid = child.id();
     // **読み取りは実行中に並行して行う。** パイプのバッファは有限なので、
     // 終わってから読もうとすると、たくさん出す子は書き込みで止まったまま
@@ -1461,6 +1485,80 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn 標準入力で渡した依頼文は改行ごと届く() {
+        let dir = ws("exec-stdin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = std::time::Duration::from_secs(10);
+        let prompt = "一行目\n二行目\n";
+        let (code, why, out) = run_resolved_capped(
+            Path::new("/bin/sh"),
+            &["-c", "cat"],
+            &dir,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            1024 * 1024,
+            Some(prompt.as_bytes()),
+        );
+        assert_eq!((code, why), (0, ValidationOutcome::Passed), "{out:?}");
+        assert!(out.stdout.contains("一行目\n二行目"), "{out:?}");
+        // **読まずに終わる子でも固まらない。** パイプの容量を超える量を渡す。
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let (_, why, out) = run_resolved_capped(
+            Path::new("/bin/sh"),
+            &["-c", "exit 0"],
+            &dir,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            1024,
+            Some(&big),
+        );
+        assert_eq!(why, ValidationOutcome::Passed, "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// npm の `claude.cmd` / `codex.cmd` で仕様生成が `SpawnFailed` (127) に
+    /// なっていた不具合の再現と、直し方の証明を 1 本で取る (A/B)。
+    #[cfg(windows)]
+    #[test]
+    fn バッチには改行入りの引数を渡せず標準入力なら届く() {
+        let dir = ws("exec-bat-stdin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("echo-stdin.cmd");
+        std::fs::write(&bat, "@findstr \"^\"\r\n").unwrap();
+        let t = std::time::Duration::from_secs(30);
+        let prompt = "line-one\nline-two\n";
+        // A: 引数で渡す — std が起こす前に断る。
+        let (code, why, out) = run_resolved_capped(
+            &bat,
+            &[prompt],
+            &dir,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            1024,
+            None,
+        );
+        assert_eq!((code, why), (127, ValidationOutcome::SpawnFailed), "{out:?}");
+        // B: 標準入力で渡す — 改行ごと届く。
+        let (code, why, out) = run_resolved_capped(
+            &bat,
+            &[],
+            &dir,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            1024,
+            Some(prompt.as_bytes()),
+        );
+        assert_eq!((code, why), (0, ValidationOutcome::Passed), "{out:?}");
+        assert!(out.stdout.contains("line-two"), "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn 終わらない検証は時間切れで打ち切る() {
         // **無期限に待たない。** 待つと、そのタスクは永久に `Validating`
@@ -1677,7 +1775,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (code, why, output) = run_resolved_capped(
             Path::new("/bin/sh"), &["-c", "printf 'SPEC_START\\n'; i=0; while [ $i -lt 6000 ]; do printf 'requirement\\n'; i=$((i+1)); done; printf 'SPEC_END\\n'"],
-            &dir, std::time::Duration::from_secs(10), &new_cancel_flag(), &new_pid_slot(), 128 * 1024);
+            &dir, std::time::Duration::from_secs(10), &new_cancel_flag(), &new_pid_slot(), 128 * 1024, None);
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(code, 0);
         assert_eq!(why, ValidationOutcome::Passed);
