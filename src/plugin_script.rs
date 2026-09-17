@@ -714,7 +714,7 @@ mod tests {
         let f = dir.join("prs.json");
         std::fs::write(
             &f,
-            r#"[{"number":7,"title":"直す\tやつ","author":{"login":"e-ma009"},
+            r#"[{"number":7,"title":"直す\tやつ","author":{"login":"octocat"},
                  "labels":[{"name":"bug"},{"name":"win"}],"state":"OPEN","headRefName":"fix/x"},
                 {"number":8,"title":"もう 1 つ","author":{},"labels":[],"state":"MERGED"}]"#,
         )
@@ -733,7 +733,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(
-            lines[0], "7\t直す やつ\te-ma009\tbug, win\tOPEN\tfix/x",
+            lines[0], "7\t直す やつ\toctocat\tbug, win\tOPEN\tfix/x",
             "タブは空白へ畳み、labels は連結する"
         );
         assert_eq!(
