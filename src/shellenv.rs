@@ -143,6 +143,134 @@ fn shell_args(script: &str) -> Vec<String> {
     }
 }
 
+// ───────────────── プラグイン用の POSIX シェル (sh) ─────────────────
+
+/// プラグインのスクリプトを実行する [`Command`] を組む。見つからなければ理由を返す。
+///
+/// # なぜ [`shell_command`] と別なのか
+///
+/// プラグインの実体は **POSIX シェルスクリプト**である (`docs/plugins.md`)。
+/// ところが Windows の [`shell_command`] は `%COMSPEC% /C` — cmd.exe を通すので、
+/// `run = 'sh "$ZV_PLUGIN_DIR/x.sh"'` は 2 つの理由で必ず失敗する:
+///
+/// 1. **`sh.exe` は PATH に無い。** Git for Windows が PATH へ入れるのは
+///    `Git\cmd` だけで、`sh.exe` が居る `Git\usr\bin` は意図的に外れている
+///    (実測: `Get-Command sh` → 見つからない)
+/// 2. cmd は `$ZV_PLUGIN_DIR` を展開しない (`%VAR%` 形式しか知らない)
+///
+/// 実害: フックを持つ同梱プラグイン 3 つ (quick-actions の startup /
+/// usage-meter の interval / worktrees の git_change) が**毎起動で失敗し、
+/// 右下へ通知を撒いていた**。
+///
+/// そこでプラグインだけは cmd を通さず、[`posix_shell`] が見つけた `sh` へ
+/// 直接渡す。引数は `-lc` で unix と揃える — **`-c` では coreutils が引けない**。
+/// 実測 (PATH を `system32;Windows;Git\cmd` に絞って比較):
+///
+/// | 呼び方 | sed / awk / tr / head / stat / date / basename |
+/// |--------|-----------------------------------------------|
+/// | `sh -c`  | **全滅** (PATH は `/c/Windows/system32:/c/Windows:/cmd` のまま) |
+/// | `sh -lc` | 全部見つかる (`/etc/profile` が `/usr/bin` を通す) |
+pub fn script_command(script: &str) -> Result<Command, String> {
+    #[cfg(windows)]
+    {
+        let sh = posix_shell().ok_or_else(posix_shell_hint)?;
+        let mut c = crate::procx::hidden_command(&sh);
+        c.arg("-lc").arg(script);
+        apply_path(&mut c);
+        Ok(c)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(shell_command(script))
+    }
+}
+
+/// プラグインのスクリプトを走らせる `sh` の在り処。プロセス内で一度だけ解決する。
+///
+/// 探し方は [`posix_shell_candidates`] を参照。**絶対パスは 1 つも書かない**
+/// (どのユーザー名・どの導入先でも動くよう、env と `git` の実体から導く)。
+pub fn posix_shell() -> Option<PathBuf> {
+    POSIX_SHELL
+        .get_or_init(|| {
+            let on_path = which("sh");
+            let git = which("git");
+            posix_shell_candidates(on_path.as_deref(), git.as_deref(), &|k| {
+                std::env::var_os(k).map(PathBuf::from)
+            })
+            .into_iter()
+            .find(|p| is_executable(p))
+        })
+        .clone()
+}
+
+static POSIX_SHELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// `sh` の候補を、試す順に並べる (実在確認はしない純関数 — 表で固定できる)。
+///
+/// `on_path` は PATH 上の `sh`、`git` は PATH 上の `git` の実体、`env` は
+/// 環境変数の読み取り。呼び出し側が探針を渡すので、テストは OS に依存しない。
+fn posix_shell_candidates(
+    on_path: Option<&Path>,
+    git: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    // 1. 明示指定が最優先 (変わった置き場でも、設定 1 行で直せる逃げ道)
+    if let Some(p) = env("ZAIVERN_POSIX_SHELL") {
+        push(p, &mut out);
+    }
+    // 2. PATH 上にあるならそれ (端末から起動したときはこれが正解)
+    if let Some(p) = on_path {
+        push(p.to_path_buf(), &mut out);
+    }
+    if cfg!(windows) {
+        // 3. git の隣。Git for Windows は `<root>\cmd\git.exe` または
+        //    `<root>\mingw64\bin\git.exe` に居て、sh は `<root>\usr\bin\sh.exe`。
+        //    どちらの配置でも祖先を 3 つ遡れば `<root>` に当たる。
+        if let Some(g) = git {
+            for anc in g.ancestors().skip(1).take(3) {
+                for n in ["sh.exe", "bash.exe"] {
+                    push(anc.join("usr").join("bin").join(n), &mut out);
+                }
+            }
+        }
+        // 4. よくある導入先 (env から導く)
+        for (k, rel) in [
+            ("ProgramFiles", "Git"),
+            ("ProgramFiles(x86)", "Git"),
+            ("LOCALAPPDATA", r"Programs\Git"),
+            ("USERPROFILE", r"scoop\apps\git\current"),
+        ] {
+            if let Some(root) = env(k) {
+                for n in ["sh.exe", "bash.exe"] {
+                    push(root.join(rel).join("usr").join("bin").join(n), &mut out);
+                }
+            }
+        }
+    } else {
+        for p in ["/bin/sh", "/usr/bin/sh", "/bin/bash"] {
+            push(PathBuf::from(p), &mut out);
+        }
+    }
+    out
+}
+
+/// `sh` が見つからないときの案内 (原因と直し方を 1 行で)。
+///
+/// プラグイン一覧・通知・CLI の 3 箇所が同じ文を使う (真実の在り処を 1 つに保つ)。
+pub fn posix_shell_hint() -> String {
+    if cfg!(windows) {
+        crate::i18n::tr("プラグインの実行に必要な POSIX シェル (sh) が見つかりません。Git for Windows を入れると sh.exe が同梱されます。別の場所にあるなら環境変数 ZAIVERN_POSIX_SHELL でそのパスを指定してください。")
+    } else {
+        crate::i18n::tr("プラグインの実行に必要な POSIX シェル (sh) が見つかりません。環境変数 ZAIVERN_POSIX_SHELL でそのパスを指定してください。")
+    }
+}
+
 // ───────────────────────── PATH の組み立て ─────────────────────────
 
 /// 実際に PATH を解決する ([`user_path`] の中身)。
@@ -573,5 +701,75 @@ mod tests {
             .output()
             .expect("起動できる");
         assert!(String::from_utf8_lossy(&out.stdout).contains("zaivern-ok"));
+    }
+
+    /// Windows では `sh.exe` が PATH に居ないので、**git の実体から**辿れることが
+    /// 唯一の頼り。Git for Windows の 2 つの配置 (`cmd\git.exe` /
+    /// `mingw64\bin\git.exe`) の**どちらでも** `<root>\usr\bin\sh.exe` を
+    /// 候補に出すこと。ここが出せないと、同梱プラグインは全部死ぬ。
+    #[test]
+    fn posix_shell候補はgitの実体から導ける() {
+        let no_env = |_: &str| None;
+        for git in [
+            r"C:\Program Files\Git\cmd\git.exe",
+            r"C:\Program Files\Git\mingw64\bin\git.exe",
+        ] {
+            let cands = posix_shell_candidates(None, Some(Path::new(git)), &no_env);
+            let want = PathBuf::from(r"C:\Program Files\Git")
+                .join("usr")
+                .join("bin")
+                .join("sh.exe");
+            if cfg!(windows) {
+                assert!(
+                    cands.contains(&want),
+                    "{git} から {} を導けていない: {cands:?}",
+                    want.display()
+                );
+            } else {
+                // 非 Windows では Windows 用の候補を混ぜない (無駄な stat を増やさない)
+                assert!(!cands.contains(&want), "非 Windows に .exe 候補が出た");
+            }
+        }
+    }
+
+    /// 明示指定 (`ZAIVERN_POSIX_SHELL`) は必ず最優先。
+    /// 変わった置き場の利用者が、こちらの版を待たずに直せる逃げ道になる。
+    #[test]
+    fn posix_shell候補は明示指定を最優先する() {
+        let env = |k: &str| (k == "ZAIVERN_POSIX_SHELL").then(|| PathBuf::from("/opt/zv/sh"));
+        let cands = posix_shell_candidates(Some(Path::new("/bin/sh")), None, &env);
+        assert_eq!(cands.first(), Some(&PathBuf::from("/opt/zv/sh")));
+        assert!(
+            cands.contains(&PathBuf::from("/bin/sh")),
+            "PATH 上の sh も残る"
+        );
+    }
+
+    /// 候補に重複を残さない (同じパスを 2 度 stat しても意味が無い)。
+    #[test]
+    fn posix_shell候補は重複しない() {
+        let env = |k: &str| (k == "ZAIVERN_POSIX_SHELL").then(|| PathBuf::from("/bin/sh"));
+        let cands = posix_shell_candidates(Some(Path::new("/bin/sh")), None, &env);
+        let uniq: HashSet<&PathBuf> = cands.iter().collect();
+        assert_eq!(uniq.len(), cands.len(), "重複がある: {cands:?}");
+    }
+
+    /// DoD: この OS で実際に POSIX シェルが見つかり、プラグインの `run` の形
+    /// (`sh "<パス>"` — cmd では展開できない `$VAR` を含む) が通ること。
+    /// **`sh` が引けないと同梱プラグインは 1 つも動かない**ので、番人を置く。
+    #[test]
+    fn script_commandはプラグインのrunを走らせられる() {
+        let Some(sh) = posix_shell() else {
+            eprintln!("[skip] POSIX シェルが無い環境 (Windows で Git 未導入など)");
+            return;
+        };
+        assert!(sh.is_file(), "{} は実体を指す", sh.display());
+        let mut cmd = script_command("printf '%s\n' \"$ZV_PROBE\"").expect("組める");
+        cmd.env("ZV_PROBE", "zaivern-ok");
+        let out = cmd.output().expect("起動できる");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("zaivern-ok"),
+            "$VAR が展開されていない (cmd を通していないか?): {out:?}"
+        );
     }
 }

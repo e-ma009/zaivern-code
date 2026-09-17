@@ -42,6 +42,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+// プラグインのスクリプトが呼ぶ道具 (`zai plugin emit` / `json` / `usage-scan`)。
+// `agents.rs` の `approvals` / `cmdwrite` と同じく `#[path]` でこのモジュールの
+// 子として取り込む (main.rs を触らない = 並列ブランチの衝突面を増やさない)。
+#[path = "plugin_script.rs"]
+pub mod script;
+
 /// このビルドが解釈できるマニフェスト API 世代の上限。
 ///
 /// * 1 … コマンド / テーマ / スニペット
@@ -409,6 +415,18 @@ impl Plugin {
     /// 実際に機能を登録してよいか (有効かつマニフェストが健全)。
     pub fn active(&self) -> bool {
         self.enabled && self.error.is_none()
+    }
+
+    /// 実行するシェル行を 1 つでも持つか (= POSIX シェルが要るか)。
+    ///
+    /// 言語パック (`japanese-mode` 等) は辞書だけなので `run` を持たない。
+    /// ここを見ずに一律で門を立てると、**シェルが無い環境で言語が切り替え
+    /// られなくなる**。
+    pub fn needs_posix_shell(&self) -> bool {
+        let has = |s: &String| !s.trim().is_empty();
+        self.commands.iter().any(|c| has(&c.run))
+            || self.hooks.iter().any(|h| has(&h.run))
+            || self.panels.iter().any(|p| has(&p.run))
     }
 
     /// 設定の現在値 (未設定なら宣言された既定値、宣言も無ければ空)。
@@ -848,7 +866,30 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         error: None,
     };
     p.apply_settings(&HashMap::new()); // 既定値で初期化
+    p.error = script_gate(
+        p.needs_posix_shell(),
+        crate::shellenv::posix_shell().as_deref(),
+    );
     Ok(p)
+}
+
+/// スクリプトを持つプラグインに POSIX シェルが要る、という門 (純関数)。
+///
+/// # なぜ「読み込み時に error へ落とす」のか
+///
+/// `sh` が無い環境で `run` を撃つと、**フックが毎起動で失敗して通知を撒く**
+/// (0.24.4 の Windows で実際に起きた: 起動のたびに 3 件)。かといって黙って
+/// 捨てると「動いているのに何も起きない」になる。
+///
+/// [`Plugin::active`] は `error.is_none()` を見るので、ここへ理由を入れれば
+/// **フックもコマンドも撃たれず、プラグイン一覧に理由が 1 行出る** —
+/// 新しい通知の仕組みを足さずに「静かで、かつ正直」になる。
+fn script_gate(needs_shell: bool, shell: Option<&Path>) -> Option<String> {
+    if needs_shell && shell.is_none() {
+        Some(crate::shellenv::posix_shell_hint())
+    } else {
+        None
+    }
 }
 
 /// `[[panel]]` 群を検証して PluginPanel に変換する（parse_manifest から抽出）。
@@ -1757,10 +1798,6 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
                 "scripts/report.sh",
                 include_str!("../assets/plugins/usage-meter/scripts/report.sh"),
             ),
-            (
-                "scripts/scan.py",
-                include_str!("../assets/plugins/usage-meter/scripts/scan.py"),
-            ),
         ],
     ),
     (
@@ -2341,10 +2378,6 @@ pub fn run_async(req: RunRequest, tx: Sender<RunOutcome>, ctx: egui::Context) {
 }
 
 fn run_blocking(req: &RunRequest) -> RunOutcome {
-    // シェルの選び方は OS で違う (Windows に `$SHELL` は無い) ので shellenv に任せる。
-    let shell = crate::shellenv::shell_program()
-        .to_string_lossy()
-        .into_owned();
     let fail = |msg: String| RunOutcome {
         plugin: req.plugin.clone(),
         command_id: req.command.id.clone(),
@@ -2363,7 +2396,14 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
         resave: req.resave,
     };
 
-    let mut cmd = crate::shellenv::shell_command(&req.command.run);
+    // プラグインは POSIX シェルスクリプト。Windows でも cmd を通さず `sh` へ
+    // 直接渡す (cmd 経由だと `sh` も `$VAR` も引けない)。詳細は
+    // [`crate::shellenv::script_command`] の説明。
+    let mut cmd = match crate::shellenv::script_command(&req.command.run) {
+        Ok(c) => c,
+        Err(msg) => return fail(msg),
+    };
+    let shell = cmd.get_program().to_string_lossy().into_owned();
     cmd.current_dir(&req.workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3251,6 +3291,55 @@ run = "c"
         let a = parse_actions(out);
         assert_eq!(a, vec![PluginAction::SetStatus { text: "ok".into() }]);
         assert!(parse_actions("").is_empty());
+    }
+
+    /// POSIX シェルが無い環境では、`run` を持つプラグインだけを止める。
+    ///
+    /// 全部止めると辞書だけの言語パックまで死に、止めないと**起動のたびに
+    /// フックが失敗して通知を撒く** (0.24.4 の Windows で実際に起きた)。
+    #[test]
+    fn シェルが無い環境ではrunを持つものだけ止める() {
+        let sh = std::path::Path::new("/bin/sh");
+        assert!(
+            script_gate(true, None).is_some(),
+            "sh が無いのにスクリプト持ちを通している"
+        );
+        assert!(
+            script_gate(false, None).is_none(),
+            "run を持たない言語パックまで止めている"
+        );
+        assert!(script_gate(true, Some(sh)).is_none());
+        assert!(script_gate(false, Some(sh)).is_none());
+        // 理由は空にしない (一覧の ⚠ に出る唯一の手掛かりなので)
+        assert!(!script_gate(true, None)
+            .unwrap_or_default()
+            .trim()
+            .is_empty());
+    }
+
+    /// `needs_posix_shell` は 3 種類 (コマンド / フック / パネル) の
+    /// **どれか 1 つでも** `run` を持てば true。どれかを見落とすと、
+    /// そのプラグインだけが門をすり抜けて毎起動の失敗通知に戻る。
+    #[test]
+    fn runを持つかはコマンドもフックもパネルも見る() {
+        let root = temp_dir("needs-shell");
+        let base = "[plugin]\nname = \"p\"\napi = 2\n";
+        let cases: [(&str, bool); 4] = [
+            ("", false),
+            ("\n[[command]]\ntitle = \"c\"\nrun = \"echo hi\"\n", true),
+            ("\n[[hook]]\nevent = \"startup\"\nrun = \"echo hi\"\n", true),
+            (
+                "\n[[panel]]\nid = \"x\"\ntitle = \"x\"\nrun = \"echo hi\"\n",
+                true,
+            ),
+        ];
+        for (i, (extra, want)) in cases.iter().enumerate() {
+            let dir = root.join(format!("p{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("plugin.toml"), format!("{base}{extra}")).expect("write");
+            let p = parse_manifest(&dir).expect("読める");
+            assert_eq!(p.needs_posix_shell(), *want, "{extra:?} の判定が違う");
+        }
     }
 
     // ─── v2: 有効/無効・設定 ─────────────────────────────────────

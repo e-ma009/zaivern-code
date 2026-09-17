@@ -146,6 +146,30 @@ token = "xxx"
   バンドル版のほうが新しい場合のみ再展開する（ユーザーが編集したファイルを毎回潰さない）。
 - 標準プラグインは無効化できるが、アンインストールは無効化として扱う（次回起動で復活してよい）。
 - シェルスクリプトは展開時に実行権限を付与する。
+- **同梱スクリプトは python3 を前提にしない。** JSON の組み立て・読み取り・
+  使用量の集計は `zai plugin emit` / `json` / `usage-scan`（実体は
+  `src/plugin_script.rs`）へ寄せる。Windows では Microsoft Store の
+  アプリ実行エイリアスが `python3` として PATH に居座り、`command -v` を
+  通り抜けてから exit 49 で死ぬため、存在確認では守れない。
+  例外は `element-capture`（macOS 専用。`build-prompt.py` を使う前に
+  `zv_have python3` で確認して降りる）。
+
+### 実行シェル
+
+- プラグインの `run` は **POSIX シェル**で実行する（`shellenv::script_command`）。
+  unix は `$SHELL -lc`、Windows は **cmd.exe を通さず** `sh -lc`。
+  cmd では `sh` も `$VAR` も引けないので、同梱プラグインが全滅する。
+- Windows の `sh` の探索順は `ZAIVERN_POSIX_SHELL` → PATH 上の `sh` →
+  PATH 上の `git` の祖先（`<Git>\usr\bin\sh.exe`）→ env 由来のよくある導入先。
+  **絶対パスをコードへ書かない**（`shellenv::posix_shell_candidates` は純関数で、
+  探針＝`which` の結果と env を引数で受ける）。
+- 引数は `-c` ではなく **`-lc`**。`-c` では Git for Windows の `/etc/profile` が
+  読まれず、`sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` が
+  1 つも引けない（実測）。
+- `sh` が見つからない環境では、**`run` を 1 つでも持つプラグインを読み込み時に
+  `error` にする**（`plugins::script_gate`）。`Plugin::active` が false になるので
+  フックもコマンドも撃たれず、一覧に理由が 1 行出る。
+  起動のたびに失敗通知を撒かないための門であって、黙って捨てるためではない。
 
 ## 6. CLI 制御チャネル
 
