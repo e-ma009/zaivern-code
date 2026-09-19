@@ -484,7 +484,7 @@ fn walk_sessions(root: &Path) -> Vec<Found> {
             let Ok(md) = e.metadata() else { continue };
             if md.is_dir() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if depth + 1 < MAX_DEPTH && !SKIP_DIR_NAMES.contains(&name.as_str()) {
+                if depth < MAX_DEPTH && !SKIP_DIR_NAMES.contains(&name.as_str()) {
                     queue.push((path, depth + 1));
                 }
                 continue;
@@ -797,19 +797,27 @@ mod tests {
     }
 
     /// 走査は深さと件数の上限を守る (ホーム全体を掘り続けない)。
+    /// ルートを深さ 0 とし、深さ MAX_DEPTH のディレクトリにあるファイルまで
+    /// 拾い、それより深いものは拾わない (旧 scan.py の os.walk と同じ境界)。
     #[test]
     fn walkは深さ上限を守る() {
         let dir = crate::test_util::unique_temp_dir("zaivern-plugin-script", "walk");
-        let deep = dir.join("a").join("b").join("c").join("d").join("e");
-        std::fs::create_dir_all(&deep).expect("mkdir");
+        let at_limit = dir.join("a").join("b").join("c").join("d");
+        let over_limit = at_limit.join("e");
+        std::fs::create_dir_all(&over_limit).expect("mkdir");
         std::fs::write(dir.join("top.jsonl"), "{}\n").expect("write");
-        std::fs::write(deep.join("deep.jsonl"), "{}\n").expect("write");
+        std::fs::write(at_limit.join("mid.jsonl"), "{}\n").expect("write");
+        std::fs::write(over_limit.join("deep.jsonl"), "{}\n").expect("write");
         let found = walk_sessions(&dir);
         let names: Vec<String> = found
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"top.jsonl".to_string()));
+        assert!(
+            names.contains(&"mid.jsonl".to_string()),
+            "深さ {MAX_DEPTH} のファイルを拾えていない: {names:?}"
+        );
         assert!(
             !names.contains(&"deep.jsonl".to_string()),
             "深さ {MAX_DEPTH} を超えて掘っている: {names:?}"

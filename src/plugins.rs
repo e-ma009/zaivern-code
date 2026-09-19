@@ -3679,22 +3679,15 @@ run = "c"
 
     #[test]
     fn run_reports_failure_and_timeout() {
-        // コマンドは OS のシェル (unix: $SHELL -c / Windows: cmd /C) で走るので
-        // 構文もそれぞれに合わせる (cmd は `;` を区切りとして解さない)。
-        let fail_cmd = if cfg!(windows) {
-            "echo boom 1>&2 & exit 3"
-        } else {
-            "echo boom >&2; exit 3"
-        };
-        // Windows は cmd ビルトインだけで時間を潰す (rem のビジーループ)。
-        // ping 等の外部コマンドを使うと、孫がパイプの書き込みハンドルを継承した
-        // まま生き残り (リダイレクトしても**ハンドルの継承**は防げない)、cmd を
-        // kill しても EOF が来ず run_blocking の read join が孫の寿命まで待つ。
-        let sleep_cmd = if cfg!(windows) {
-            "for /L %i in (1,1,2000000000) do @rem"
-        } else {
-            "sleep 30"
-        };
+        // run は POSIX シェル (shellenv::script_command → sh -lc) で走るので
+        // 構文は sh に揃える (cmd 構文は構文エラーで即終了し、タイムアウトを
+        // 検証できない)。
+        let fail_cmd = "echo boom >&2; exit 3";
+        // 待機はシェルのビジーループ。外部コマンド (sleep 等) を使うと、孫が
+        // パイプの書き込みハンドルを継承したまま生き残り (リダイレクトしても
+        // ハンドルの継承は防げない)、シェルを kill しても EOF が来ず
+        // run_blocking の read join が孫の寿命まで待つ。
+        let sleep_cmd = "while :; do :; done";
         let out = run_sync(RunRequest {
             plugin: "p".into(),
             command: basic_cmd(fail_cmd, 10),
