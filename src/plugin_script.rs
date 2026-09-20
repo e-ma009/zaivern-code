@@ -537,10 +537,14 @@ fn parse_usage(files: &mut [Found]) -> (BTreeMap<String, f64>, BTreeMap<String, 
         if f.size == 0 || f.size > MAX_BYTES_PER_FILE {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&f.path) else {
+        let Ok(bytes) = std::fs::read(&f.path) else {
             continue;
         };
         parsed += 1;
+        // 旧 scan.py は errors="replace" で読んでいた。1 バイトでも不正
+        // UTF-8 があると read_to_string ではファイルごと捨てるので、
+        // 置換文字に直して正常な行を救う。
+        let text = String::from_utf8_lossy(&bytes);
         let stripped = text.trim_start();
         // 1 ファイル 1 JSON (整形済み) か、JSON Lines かを内容で見分ける
         if stripped.starts_with('{') && !stripped.contains("\n{") {
@@ -871,6 +875,30 @@ mod tests {
                 .any(|f| f.path.to_string_lossy().contains("outside")),
             "symlink 経由のパスが混入している: {names:?}"
         );
+    }
+
+    /// 不正 UTF-8 を含む記録でもファイルごと捨てず、読める行は集計する
+    /// (旧 scan.py の errors="replace" と同じ見え方にする)。
+    #[test]
+    fn 不正utf8の混じる記録も読める行は集計する() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-plugin-script", "bad-utf8");
+        let file = dir.join("session.jsonl");
+        // 正常行 / 壊れたバイトを含む行 / 正常行、の順で書く
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(b"{\"input_tokens\": 10}\n");
+        body.extend_from_slice(b"{\"output_tokens\": \"\xff\xfe\"}\n");
+        body.extend_from_slice(b"{\"output_tokens\": 4}\n");
+        std::fs::write(&file, &body).expect("write");
+        let md = std::fs::metadata(&file).expect("metadata");
+        let mut files = vec![Found {
+            size: md.len(),
+            mtime: md.modified().expect("mtime"),
+            path: file,
+        }];
+        let (tokens, _, parsed) = parse_usage(&mut files);
+        assert_eq!(parsed, 1, "ファイル自体は数える");
+        assert_eq!(tokens.get("input_tokens"), Some(&10.0), "{tokens:?}");
+        assert_eq!(tokens.get("output_tokens"), Some(&4.0), "{tokens:?}");
     }
 
     /// 利用量らしき数値だけを拾い、関係ない数値は拾わないこと。

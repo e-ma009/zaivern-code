@@ -3894,6 +3894,97 @@ run = "c"
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `shell = "posix"` のような manifest 変更は、版を上げた時だけ
+    /// 展開済みユーザーへ届く。版の据え置きでは `version_newer` が偽なので
+    /// 届かない — 中身を変えたら必ず version を上げる約束を、この形で固定する。
+    #[test]
+    fn bundled_manifest_change_reaches_users_only_with_version_bump() {
+        let shell_bundle = |ver: &str, shell: Option<&str>| {
+            let line = shell
+                .map(|s| format!("shell = \"{s}\"\n"))
+                .unwrap_or_default();
+            vec![(
+                "std-demo".to_string(),
+                vec![
+                    (
+                        "plugin.toml".to_string(),
+                        format!(
+                            "[plugin]\nname = \"std-demo\"\nversion = \"{ver}\"\napi = 2\n{line}"
+                        ),
+                    ),
+                    ("run.sh".to_string(), format!("#!/bin/sh\necho {ver}\n")),
+                ],
+            )]
+        };
+        let manifest = |root: &Path| {
+            std::fs::read_to_string(root.join("std-demo").join("plugin.toml")).unwrap()
+        };
+        let stamp =
+            |root: &Path| std::fs::read_to_string(root.join("std-demo").join(".bundled")).unwrap();
+
+        let root = temp_dir("bundle-shell");
+        // shell 未指定の 0.1.0 が既に入っている既存ユーザーの状態
+        assert_eq!(
+            seed(&root, &shell_bundle("0.1.0", None)),
+            vec!["std-demo".to_string()]
+        );
+        assert!(!manifest(&root).contains("shell"), "{:?}", manifest(&root));
+        assert_eq!(stamp(&root), "0.1.0");
+
+        // 版が据え置きなら、manifest を変えても届かない (= bump 忘れの姿)
+        assert!(seed(&root, &shell_bundle("0.1.0", Some("posix"))).is_empty());
+        assert!(!manifest(&root).contains("shell"), "{:?}", manifest(&root));
+        assert_eq!(stamp(&root), "0.1.0");
+
+        // 版が上がれば新 manifest が届き、.bundled も新しい版へ進む
+        assert_eq!(
+            seed(&root, &shell_bundle("0.2.0", Some("posix"))),
+            vec!["std-demo".to_string()]
+        );
+        assert!(
+            manifest(&root).contains("shell = \"posix\""),
+            "{:?}",
+            manifest(&root)
+        );
+        assert_eq!(stamp(&root), "0.2.0");
+        assert_eq!(
+            parse_manifest(&root.join("std-demo")).unwrap().shell,
+            PluginShell::Posix
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `sh` を呼ぶ run を持つ標準プラグインは必ず `shell = "posix"` を
+    /// 書く。opt-in を書き忘れると Windows では cmd.exe /C へ流れて
+    /// 「'sh' は認識されていません」が再発する — 内容の整合を担保する。
+    #[test]
+    fn bundled_plugins_invoking_sh_opt_into_posix() {
+        for (name, files) in BUNDLED {
+            let Some((_, toml)) = files.iter().find(|(rel, _)| *rel == "plugin.toml") else {
+                continue;
+            };
+            let dir = temp_dir(&format!("bundled-{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.toml"), toml).unwrap();
+            let p = parse_manifest(&dir)
+                .unwrap_or_else(|e| panic!("{name}/plugin.toml が解析できない: {e}"));
+            let invokes_sh = p
+                .commands
+                .iter()
+                .map(|c| c.run.as_str())
+                .chain(p.hooks.iter().map(|h| h.run.as_str()))
+                .chain(p.panels.iter().map(|h| h.run.as_str()))
+                .any(|run| run.split_whitespace().next() == Some("sh"));
+            assert_eq!(
+                invokes_sh,
+                p.shell == PluginShell::Posix,
+                "{name}: sh を呼ぶ run と shell = \"posix\" が食い違っている"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn version_compare_and_extraction() {
         assert!(version_newer("1.0.1", "1.0.0"));
