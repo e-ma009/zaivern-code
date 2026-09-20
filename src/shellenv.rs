@@ -150,40 +150,38 @@ fn shell_args(script: &str) -> Vec<String> {
 ///
 /// # なぜ [`shell_command`] と別なのか
 ///
-/// 同梱プラグインの実体は **POSIX シェルスクリプト**である (`docs/plugins.md`)。
-/// ところが Windows の [`shell_command`] は `%COMSPEC% /C` — cmd.exe を通すので、
-/// `run = 'sh "$ZV_PLUGIN_DIR/x.sh"'` は 2 つの理由で必ず失敗する:
+/// `shell = "posix"` は「OS の既定シェル」ではなく **POSIX 互換シェル**の
+/// 指定。`$SHELL` には fish / nushell のような非 POSIX シェルが入りうるため、
+/// unix / macOS であっても [`shell_command`] (`$SHELL -lc`) では契約を
+/// 満たせない。Windows ではなおさらで、`%COMSPEC% /C` は `sh` も
+/// `$VAR` 展開も引けない (Git for Windows は PATH に `Git\cmd` だけを入れ、
+/// `sh.exe` の居る `Git\usr\bin` を意図的に外している)。実害として、
+/// フックを持つ同梱プラグインが Windows で**毎起動失敗し通知を撒いていた**。
 ///
-/// 1. **`sh.exe` は PATH に無い。** Git for Windows が PATH へ入れるのは
-///    `Git\cmd` だけで、`sh.exe` が居る `Git\usr\bin` は意図的に外れている
-///    (実測: `Get-Command sh` → 見つからない)
-/// 2. cmd は `$ZV_PLUGIN_DIR` を展開しない (`%VAR%` 形式しか知らない)
-///
-/// 実害: フックを持つ同梱プラグイン 3 つ (quick-actions の startup /
-/// usage-meter の interval / worktrees の git_change) が**毎起動で失敗し、
-/// 右下へ通知を撒いていた**。
-///
-/// そこでプラグインだけは cmd を通さず、[`posix_shell`] が見つけた `sh` へ
-/// 直接渡す。引数は `-lc` で unix と揃える — **`-c` では coreutils が引けない**。
+/// そこで全 OS で [`posix_shell`] が見つけた `sh` へ直接 `-lc` で渡す。
+/// **`-c` では Windows の coreutils が引けない** — MSYS 系では login shell
+/// の `/etc/profile` が `/usr/bin` 等を PATH へ通すので `-l` が要る。
 /// 実測 (PATH を `system32;Windows;Git\cmd` に絞って比較):
 ///
 /// | 呼び方 | sed / awk / tr / head / stat / date / basename |
 /// |--------|-----------------------------------------------|
 /// | `sh -c`  | **全滅** (PATH は `/c/Windows/system32:/c/Windows:/cmd` のまま) |
 /// | `sh -lc` | 全部見つかる (`/etc/profile` が `/usr/bin` を通す) |
+///
+/// # Windows の cwd
+///
+/// ところが MSYS 系の `/etc/profile` は login shell で `$HOME` へ cd する。
+/// プラグインの `Command::current_dir` (= ワークスペース) をシェル内の
+/// `pwd` まで届けるため、MSYS 公式の `CHERE_INVOKING=1` を渡して
+/// profile の cd を抑止する (各プラグインへ `cd` を書かせないため、
+/// 起動側 1 か所で保証する)。
 pub fn script_command(script: &str) -> Result<Command, String> {
+    let sh = posix_shell().ok_or_else(posix_shell_hint)?;
+    let mut c = crate::procx::hidden_command(&sh);
+    c.arg("-lc").arg(script);
     #[cfg(windows)]
-    {
-        let sh = posix_shell().ok_or_else(posix_shell_hint)?;
-        let mut c = crate::procx::hidden_command(&sh);
-        c.arg("-lc").arg(script);
-        apply_path(&mut c);
-        Ok(c)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(shell_command(script))
-    }
+    c.env("CHERE_INVOKING", "1");
+    Ok(c)
 }
 
 /// プラグインのスクリプトを走らせる `sh` の在り処。プロセス内で一度だけ解決する。
@@ -772,5 +770,89 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).contains("zaivern-ok"),
             "$VAR が展開されていない (cmd を通していないか?): {out:?}"
         );
+    }
+
+    /// `shell = "posix"` は `$SHELL` を参照してはいけない — fish / nushell
+    /// のような非 POSIX シェルが `$SHELL` に居ても、manifest の契約である
+    /// 「POSIX シェルで実行」が破れるため。候補列挙が `SHELL` を読まず、
+    /// 組まれたコマンドが解決済みの `sh` を指すことを検査する。
+    #[test]
+    fn posix選択はユーザーのshellに依存しない() {
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let env = |k: &str| -> Option<PathBuf> {
+            asked.borrow_mut().push(k.to_string());
+            None
+        };
+        let _ = posix_shell_candidates(None, None, &env);
+        let asked = asked.into_inner();
+        assert!(
+            !asked.iter().any(|k| k == "SHELL"),
+            "posix の探索が $SHELL を参照している: {asked:?}"
+        );
+        // 実際に組まれるコマンドも $SHELL (shell_program) ではなく
+        // posix_shell() の実体を使う
+        if let Some(sh) = posix_shell() {
+            let c = script_command("echo hi").expect("組める");
+            assert_eq!(
+                c.get_program(),
+                sh.as_os_str(),
+                "posix が解決済みの sh 以外を指している: {c:?}"
+            );
+        }
+    }
+
+    /// login shell の初期化 ($HOME への cd) があっても、プラグインへ渡した
+    /// `Command::current_dir` がシェル内の `pwd` まで届くこと。
+    /// MSYS 系 (Git for Windows) では `CHERE_INVOKING=1` がこの保持を担う。
+    /// ここが崩れると `pwd`・相対パス・`git` がワークスペースを外す。
+    #[test]
+    fn posixシェルは起動cwdをシェル内pwdへ届ける() {
+        if posix_shell().is_none() {
+            // sh が無い Windows では plugin が gate で止まる (起動自体しない)
+            assert!(cfg!(windows), "unix 系で POSIX シェルが無いのは想定外");
+            return;
+        }
+        let dir = crate::test_util::unique_temp_dir("zaivern-shellenv-test", "cwd");
+        // MSYS 系の `pwd` は /c/... 形式なので `pwd -W` (Windows 形式) を
+        // 先に試し、非 MSYS では素の `pwd` に落ちる。
+        let out = script_command("pwd -W 2>/dev/null || pwd")
+            .expect("組める")
+            .current_dir(&dir)
+            .output()
+            .expect("起動できる");
+        assert!(out.status.success(), "{out:?}");
+        let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // canonicalize どうしで比較 (シンボリックリンク・8.3 短名を吸収)
+        let want = std::fs::canonicalize(&dir).expect("canon");
+        let got = std::fs::canonicalize(&printed)
+            .unwrap_or_else(|_| panic!("pwd 出力が実在パスでない: {printed}"));
+        assert_eq!(got, want, "シェル内の cwd が起動 cwd と一致しない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sh.exe` の直起動 (Git for Windows) でも、login shell の
+    /// `/etc/profile` 経由で基本コマンドが PATH から解決されること。
+    /// 同梱プラグインのスクリプトが依存する最小セットを実際に試す。
+    #[test]
+    fn posixシェルから基本コマンドが使える() {
+        if posix_shell().is_none() {
+            assert!(cfg!(windows), "unix 系で POSIX シェルが無いのは想定外");
+            return; // sh が無い Windows は gate の仕事 (別テストが保証)
+        }
+        // Windows の Git for Windows は git / ssh も usr/bin に同梱する。
+        // unix では ssh が無い環境がありうるのでコマンド群は分ける。
+        #[cfg(windows)]
+        const NEED: &str = "sh git ssh sed awk tr head stat date basename";
+        #[cfg(not(windows))]
+        const NEED: &str = "sh sed awk tr head stat date basename";
+        let out = script_command(&format!(
+            "for c in {NEED}; do command -v \"$c\" >/dev/null 2>&1 || echo \"missing:$c\"; done"
+        ))
+        .expect("組める")
+        .output()
+        .expect("起動できる");
+        assert!(out.status.success(), "{out:?}");
+        let missing = String::from_utf8_lossy(&out.stdout);
+        assert!(missing.trim().is_empty(), "見つからないコマンド: {missing}");
     }
 }

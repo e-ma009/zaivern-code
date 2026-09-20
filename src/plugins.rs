@@ -234,15 +234,16 @@ impl SettingType {
 /// 既定は [`PluginShell::Native`] —— `shell` を書かない既存 manifest は
 /// 無改造のまま従来どおり動く (unix: `$SHELL -lc`、Windows: `%COMSPEC% /C`)。
 /// POSIX シェルスクリプトを前提にするプラグインだけ、マニフェストで
-/// `shell = "posix"` と明示して opt-in する (unix では Native と同じだが、
-/// Windows では cmd を通さず `sh -lc` へ切り替わる)。
+/// `shell = "posix"` と明示して opt-in する (Native は `$SHELL` 依存なので
+/// fish 等が指定されていると POSIX 構文が壊れる — Posix は全 OS で
+/// 解決済みの `sh` を使い、Windows では cmd を通さない)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PluginShell {
     /// OS の既定シェル (従来動作。manifest の `shell` 省略時の値)。
     #[default]
     Native,
-    /// POSIX シェル (`sh -lc`)。Windows では [`crate::shellenv::posix_shell`]
-    /// が探し、見つからなければ読み込み時にプラグインを `error` へ落とす。
+    /// POSIX シェル (`sh -lc`)。[`crate::shellenv::posix_shell`] が探し、
+    /// 見つからなければ読み込み時にプラグインを `error` へ落とす。
     Posix,
 }
 
@@ -2447,7 +2448,7 @@ pub fn run_async(req: RunRequest, tx: Sender<RunOutcome>, ctx: egui::Context) {
 /// Linux から検査できる):
 /// - `Native` は従来動作そのまま — unix は `$SHELL -lc`、Windows は
 ///   `%COMSPEC% /C` ([`crate::shellenv::shell_command`])。
-/// - `Posix` は `sh -lc` ([`crate::shellenv::script_command`])。Windows で
+/// - `Posix` は全 OS で解決済みの `sh -lc` ([`crate::shellenv::script_command`])。
 ///   `sh` が見つからなければ起動前に理由を返す。
 fn run_command(shell: PluginShell, script: &str) -> Result<std::process::Command, String> {
     match shell {
@@ -2475,8 +2476,9 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
         resave: req.resave,
     };
 
-    // `shell = "posix"` と opt-in したプラグインだけ、Windows でも cmd を
-    // 通さず `sh -lc` へ直接渡す (cmd 経由だと `sh` も `$VAR` も引けない)。
+    // `shell = "posix"` と opt-in したプラグインだけ、全 OS で解決済みの
+    // `sh -lc` へ直接渡す (Windows の cmd 経由だと `sh` も `$VAR` も引けず、
+    // unix の `$SHELL` は POSIX 非互換がありうる)。
     // 未指定 (Native) の既存プラグインは従来どおり OS の既定シェルで動く。
     // 詳細は [`crate::shellenv::script_command`] の説明。
     let mut cmd = match run_command(req.command.shell, &req.command.run) {
@@ -3588,6 +3590,60 @@ run = "c"
                 assert!(!msg.trim().is_empty());
             }
         }
+    }
+
+    /// E2E: manifest の `shell = "posix"` が parse → RunRequest → 実行まで
+    /// 通り、シェル内 cwd (= workdir)・`$VAR` 展開・POSIX 構文の 3 点が
+    /// 正しいこと。login shell の $HOME への cd (MSYS 系) に負けないことを、
+    /// 実プロセスの stdout で確認する。
+    #[test]
+    fn posix指定プラグインはworkspaceで実際に動く() {
+        if crate::shellenv::posix_shell().is_none() {
+            // sh が無い Windows では gate が止める (起動自体しない)
+            assert!(cfg!(windows), "unix 系で POSIX シェルが無いのは想定外");
+            return;
+        }
+        let dir = temp_dir("posix-e2e");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::fs::write(ws.join("marker.txt"), "x").expect("write");
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"posix-test\"\napi = 2\nshell = \"posix\"\n\
+             [[command]]\ntitle = \"t\"\n\
+             run = \"(pwd -W 2>/dev/null || pwd); echo \\\"$ZV_MARK\\\"; test -f marker.txt && echo marker-ok\"\n",
+        )
+        .expect("write");
+        let p = parse_manifest(&dir).expect("読める");
+        assert_eq!(p.commands[0].shell, PluginShell::Posix);
+        let out = run_sync(RunRequest {
+            plugin: p.name.clone(),
+            command: p.commands[0].clone(),
+            stdin_text: String::new(),
+            envs: vec![("ZV_MARK".into(), "env-ok".into())],
+            workdir: ws.clone(),
+            buffer_id: None,
+            replace_range: None,
+            resave: false,
+        });
+        assert!(out.ok, "stderr: {}", out.stderr);
+        let printed = out.stdout.lines().next().unwrap_or("").trim();
+        let want = std::fs::canonicalize(&ws).expect("canon");
+        let got =
+            std::fs::canonicalize(printed).unwrap_or_else(|_| std::path::PathBuf::from(printed));
+        assert_eq!(
+            got,
+            want,
+            "シェル内 cwd が workdir でない: {printed} vs {}",
+            want.display()
+        );
+        assert!(out.stdout.contains("env-ok"), "$VAR 展開: {}", out.stdout);
+        assert!(
+            out.stdout.contains("marker-ok"),
+            "workdir の相対パスが見えていない: {}",
+            out.stdout
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── v2: 有効/無効・設定 ─────────────────────────────────────

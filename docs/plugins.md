@@ -126,11 +126,17 @@ on_save = true            # 保存時に自動実行（フォーマッタ向け�
 timeout_secs = 30         # 1〜600
 ```
 
-`run` は既定では **OS のシェル**で実行されます（unix は `$SHELL -lc`、
-Windows は `%COMSPEC% /C`）。POSIX シェルスクリプトを前提にする場合は
-`[plugin]` に **`shell = "posix"`** を書いてください —— Windows でも
-cmd ではなく `sh -lc` で走り、`sed` / `awk` / `tr` のような POSIX の道具や
-`$VAR` 形式の環境変数がそのまま使えます。`shell` を書かない既存の
+`run` は既定では **OS のシェル**で実行されます（`shell = "native"`、
+unix は `$SHELL -lc`、Windows は `%COMSPEC% /C`）。POSIX シェル
+スクリプトを前提にする場合は `[plugin]` に **`shell = "posix"`** を
+書いてください —— **全 OS で** `sh -lc` で走り、`sed` / `awk` / `tr`
+のような POSIX の道具や `$VAR` 形式の環境変数がそのまま使えます。
+unix/macOS でも `$SHELL` ではなく解決済みの `sh` を使うので、
+`$SHELL` に fish 等が設定されていても影響しません。Windows では
+Git for Windows 同梱の `sh.exe` が使われ、見つからない場合は
+`run` を持つ posix プラグインだけが読み込み時にエラーになります
+（エラー行には理由が出ます）。`ZAIVERN_POSIX_SHELL` で使う `sh`
+を明示指定もできます（全 OS で有効）。`shell` を書かない既存の
 `plugin.toml` は無改造のまま従来どおり動きます。
 
 ### `input` — スクリプトの標準入力に何を渡すか

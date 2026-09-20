@@ -164,16 +164,23 @@ token = "xxx"
   `%COMSPEC% /C`（`shellenv::shell_command`）。`shell` を書かない既存の
   `plugin.toml` は無改造のまま従来どおり動く（後方互換）。
 - POSIX シェルスクリプトを前提にするプラグインは **`shell = "posix"`** と
-  明示して opt-in する。unix では Native と同じだが、Windows では
-  **cmd.exe を通さず** `sh -lc` へ切り替わる（`shellenv::script_command`）。
-  cmd では `sh` も `$VAR` も引けないので、同梱プラグインは全て posix 指定。
-- Windows の `sh` の探索順は `ZAIVERN_POSIX_SHELL` → PATH 上の `sh` →
-  PATH 上の `git` の祖先（`<Git>\usr\bin\sh.exe`）→ env 由来のよくある導入先。
-  **絶対パスをコードへ書かない**（`shellenv::posix_shell_candidates` は純関数で、
-  探針＝`which` の結果と env を引数で受ける）。
+  明示して opt-in する。**全 OS で** `shellenv::posix_shell` が解決した `sh`
+  を `sh -lc` で起動する（`shellenv::script_command`）。unix/macOS でも
+  `$SHELL` ではなく `sh` を使う —— `$SHELL` には fish / nushell などの
+  非 POSIX シェルが入りうるため。Windows では cmd.exe を通さない
+  （cmd では `sh` も `$VAR` も引けない）。同梱プラグインは全て posix 指定。
+- `sh` の探索順は `ZAIVERN_POSIX_SHELL`（明示上書き。全 OS で有効）→
+  PATH 上の `sh` →（Windows のみ）PATH 上の `git` の祖先
+  （`<Git>\usr\bin\sh.exe`）→ env 由来のよくある導入先 →（unix）
+  `/bin/sh` 等の固定パス。**絶対パスをコードへ書かない**
+  （`shellenv::posix_shell_candidates` は純関数で、探針＝`which` の結果と
+  env を引数で受ける）。
 - 引数は `-c` ではなく **`-lc`**。`-c` では Git for Windows の `/etc/profile` が
-  読まれず、`sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` が
-  1 つも引けない（実測）。
+  読まれず、`sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` / `git` が
+  引けない（実測）。ただし MSYS 系の login shell は `/etc/profile` から
+  `$HOME` へ cd するため、プラグインの `current_dir`（= ワークスペース）を
+  シェル内 `pwd` まで届けるため **`CHERE_INVOKING=1`** を Windows で渡して
+  profile の cd を抑止する。
 - `sh` が見つからない環境では、**`shell = "posix"` で `run` を 1 つでも持つ
   プラグインだけ**を読み込み時に `error` にする（`plugins::script_gate` →
   `Plugin::needs_posix_shell`）。`Plugin::active` が false になるので
