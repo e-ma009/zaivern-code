@@ -22,6 +22,7 @@ author = ""
 description = ""
 api = 2                   # 追加: 省略時 1。`[[syntax]]` を使うなら 3
 default_enabled = true    # v3 追加: 省略時 true。false なら初回は無効で入る
+shell = "native"          # 省略時 "native"。POSIX 前提の run は "posix" (§5)
 
 [[command]]
 id = "fmt"                # 追加: 安定ID。省略時は title から slug 生成
@@ -156,9 +157,14 @@ token = "xxx"
 
 ### 実行シェル
 
-- プラグインの `run` は **POSIX シェル**で実行する（`shellenv::script_command`）。
-  unix は `$SHELL -lc`、Windows は **cmd.exe を通さず** `sh -lc`。
-  cmd では `sh` も `$VAR` も引けないので、同梱プラグインが全滅する。
+- `run` の実行シェルは manifest の `[plugin].shell` が唯一の真実の在り処で、
+  既定は **`shell = "native"`**（省略可）—— unix は `$SHELL -lc`、Windows は
+  `%COMSPEC% /C`（`shellenv::shell_command`）。`shell` を書かない既存の
+  `plugin.toml` は無改造のまま従来どおり動く（後方互換）。
+- POSIX シェルスクリプトを前提にするプラグインは **`shell = "posix"`** と
+  明示して opt-in する。unix では Native と同じだが、Windows では
+  **cmd.exe を通さず** `sh -lc` へ切り替わる（`shellenv::script_command`）。
+  cmd では `sh` も `$VAR` も引けないので、同梱プラグインは全て posix 指定。
 - Windows の `sh` の探索順は `ZAIVERN_POSIX_SHELL` → PATH 上の `sh` →
   PATH 上の `git` の祖先（`<Git>\usr\bin\sh.exe`）→ env 由来のよくある導入先。
   **絶対パスをコードへ書かない**（`shellenv::posix_shell_candidates` は純関数で、
@@ -166,9 +172,11 @@ token = "xxx"
 - 引数は `-c` ではなく **`-lc`**。`-c` では Git for Windows の `/etc/profile` が
   読まれず、`sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` が
   1 つも引けない（実測）。
-- `sh` が見つからない環境では、**`run` を 1 つでも持つプラグインを読み込み時に
-  `error` にする**（`plugins::script_gate`）。`Plugin::active` が false になるので
+- `sh` が見つからない環境では、**`shell = "posix"` で `run` を 1 つでも持つ
+  プラグインだけ**を読み込み時に `error` にする（`plugins::script_gate` →
+  `Plugin::needs_posix_shell`）。`Plugin::active` が false になるので
   フックもコマンドも撃たれず、一覧に理由が 1 行出る。
+  Native プラグインと `run` を持たない言語パックは `sh` が無くても止まらない。
   起動のたびに失敗通知を撒かないための門であって、黙って捨てるためではない。
 
 ## 6. CLI 制御チャネル

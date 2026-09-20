@@ -481,8 +481,16 @@ fn walk_sessions(root: &Path) -> Vec<Found> {
         };
         for e in rd.filter_map(|e| e.ok()) {
             let path = e.path();
-            let Ok(md) = e.metadata() else { continue };
-            if md.is_dir() {
+            // symlink は辿らない (旧 scan.py の os.walk は followlinks=False)。
+            // DirEntry::file_type はリンクそのものを見るので、リンク先の
+            // metadata で directory と誤判定して外へ出ることはない。
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if depth < MAX_DEPTH && !SKIP_DIR_NAMES.contains(&name.as_str()) {
                     queue.push((path, depth + 1));
@@ -499,6 +507,10 @@ fn walk_sessions(root: &Path) -> Vec<Found> {
             if !is_session {
                 continue;
             }
+            // ここに来るのは実ファイルだけ (symlink は上で除いた)。
+            let Ok(md) = e.metadata() else {
+                continue;
+            };
             found.push(Found {
                 size: md.len(),
                 mtime: md.modified().unwrap_or(std::time::UNIX_EPOCH),
@@ -821,6 +833,43 @@ mod tests {
         assert!(
             !names.contains(&"deep.jsonl".to_string()),
             "深さ {MAX_DEPTH} を超えて掘っている: {names:?}"
+        );
+    }
+
+    /// directory symlink を再帰しない (旧 scan.py の os.walk は
+    /// followlinks=False)。セッション置き場の外へ出ると、同じ記録を
+    /// 2 度数えたり関係ないツリー全体を掘ったりする。
+    #[cfg(unix)]
+    #[test]
+    fn walkはdirectory_symlinkを辿らない() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_util::unique_temp_dir("zaivern-plugin-script", "walk-link");
+        let sessions = dir.join("sessions");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(sessions.join("local.json"), "{}\n").expect("write");
+        std::fs::write(outside.join("secret.json"), "{}\n").expect("write");
+        // sessions/outside -> ../outside (走査ルートの外を指す directory symlink)
+        symlink(&outside, sessions.join("outside")).expect("symlink");
+        // 実体側からルートへ戻る輪も作る (辿ると visited 上限まで延々と回る)
+        symlink(&sessions, outside.join("back")).expect("symlink");
+
+        let found = walk_sessions(&sessions);
+        let names: Vec<String> = found
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"local.json".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"secret.json".to_string()),
+            "symlink 越しに走査ルートの外へ出ている: {names:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.path.to_string_lossy().contains("outside")),
+            "symlink 経由のパスが混入している: {names:?}"
         );
     }
 

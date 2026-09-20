@@ -126,9 +126,12 @@ on_save = true            # 保存時に自動実行（フォーマッタ向け�
 timeout_secs = 30         # 1〜600
 ```
 
-`run` は **POSIX シェル**で実行されます（Windows でも cmd ではなく `sh`）。
-どの OS でも動くよう、`sed` / `awk` / `tr` のような POSIX の道具か、
-自分のプラグインに同梱したスクリプトを呼んでください。
+`run` は既定では **OS のシェル**で実行されます（unix は `$SHELL -lc`、
+Windows は `%COMSPEC% /C`）。POSIX シェルスクリプトを前提にする場合は
+`[plugin]` に **`shell = "posix"`** を書いてください —— Windows でも
+cmd ではなく `sh -lc` で走り、`sed` / `awk` / `tr` のような POSIX の道具や
+`$VAR` 形式の環境変数がそのまま使えます。`shell` を書かない既存の
+`plugin.toml` は無改造のまま従来どおり動きます。
 
 ### `input` — スクリプトの標準入力に何を渡すか
 
@@ -516,15 +519,17 @@ GitHub にそのまま置いても構いませんし、フォルダを直接
 🔌 タブの ⟳ で再読み込みしてください。`plugin.toml` を書き換えたときは必須です。
 
 **Windows で「POSIX シェル (sh) が見つかりません」と出る**
-プラグインは POSIX シェルスクリプトなので、Windows でも `sh` が要ります。
-Zaivern は **cmd.exe を通さず** `sh` を直接起こしますが、置き場所を自分で
-探す必要があります（Git for Windows は `Git\cmd` しか PATH へ入れず、
-`sh.exe` が居る `Git\usr\bin` は PATH の外だからです）。
+`shell = "posix"` を指定したプラグインは Windows でも `sh` が要ります
+（`sh` スクリプトを呼ぶ同梱プラグインは全て posix 指定）。Zaivern は **cmd.exe を通さず** `sh` を
+直接起こしますが、置き場所を自分で探す必要があります（Git for Windows は
+`Git\cmd` しか PATH へ入れず、`sh.exe` が居る `Git\usr\bin` は PATH の外
+だからです）。
 
 * 探す順番: 環境変数 `ZAIVERN_POSIX_SHELL` → PATH 上の `sh` →
   **PATH 上の `git` の隣**（`<Git>\usr\bin\sh.exe`）→ よくある導入先
 * つまり **Git for Windows が入っていれば、何も設定せずに動きます**
 * 別の場所にある人は `ZAIVERN_POSIX_SHELL` にその実体のパスを入れてください
 
-見つからない間、スクリプトを持つプラグインは 🔌 タブで ⚠ 付きの停止状態になります
-（フックも撃たれません）。辞書だけの言語パックはそのまま使えます。
+見つからない間、posix 指定プラグインは 🔌 タブで ⚠ 付きの停止状態になります
+（フックも撃たれません）。`shell` を書かないプラグインと辞書だけの言語パックは
+そのまま使えます。

@@ -555,13 +555,17 @@
 - **`cmd /C` にコマンド全体を 1 引数で押し込まない。** Rust の `Command` は
   引数ごとに Windows の規則で引用するので、cmd 側の再解析とずれて失敗する。
   引数は分けて渡す。unix もシェルを挟まず実体 (`mv` 等) を直に起こすほうが安全。
-- **Windows の `sh` は PATH に無い。プラグインを cmd に通すと全滅する。**
+- **Windows の `sh` は PATH に無い。POSIX 前提のプラグインを cmd に通すと全滅する。**
   Git for Windows が PATH へ入れるのは `Git\cmd` だけで、`sh.exe` が居る
   `Git\usr\bin` は**意図的に外れている**。同梱プラグインの `run` は
   `sh "$ZV_PLUGIN_DIR/x.sh"` なので、`%COMSPEC% /C` 経由では (1) `sh` が
   見つからず (2) `$VAR` も展開されない — 0.24.4 では**起動のたびに 3 件の
   失敗通知**が出ていた (quick-actions / usage-meter / worktrees のフック)。
-  プラグインは `shellenv::script_command` (= `sh -lc`) で起こすこと。
+  そこで `run` の実行シェルは manifest の `[plugin].shell` が決める:
+  **既定は `"native"`** (unix: `$SHELL -lc`、Windows: `%COMSPEC% /C`。
+  `shell` を書かない既存 plugin.toml は無改造のまま従来どおり動く)。
+  POSIX 前提のプラグインだけ `shell = "posix"` を書き、それらは
+  `shellenv::script_command` (= `sh -lc`) で起こすこと。
   - **`-c` ではなく `-lc`。** `-c` だと `/etc/profile` が読まれず、
     `sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` が 1 つも
     引けない (実測。PATH は `/c/Windows/system32:/c/Windows:/cmd` のまま)

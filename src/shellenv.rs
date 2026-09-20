@@ -145,11 +145,12 @@ fn shell_args(script: &str) -> Vec<String> {
 
 // ───────────────── プラグイン用の POSIX シェル (sh) ─────────────────
 
-/// プラグインのスクリプトを実行する [`Command`] を組む。見つからなければ理由を返す。
+/// `shell = "posix"` と opt-in したプラグインのスクリプトを実行する
+/// [`Command`] を組む。見つからなければ理由を返す。
 ///
 /// # なぜ [`shell_command`] と別なのか
 ///
-/// プラグインの実体は **POSIX シェルスクリプト**である (`docs/plugins.md`)。
+/// 同梱プラグインの実体は **POSIX シェルスクリプト**である (`docs/plugins.md`)。
 /// ところが Windows の [`shell_command`] は `%COMSPEC% /C` — cmd.exe を通すので、
 /// `run = 'sh "$ZV_PLUGIN_DIR/x.sh"'` は 2 つの理由で必ず失敗する:
 ///
